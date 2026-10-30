@@ -10,3 +10,9 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# 环境变量与密钥(绝不提交)
+.env
+.env.*
+
+omni_vl_guard_2b/

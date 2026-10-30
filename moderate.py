@@ -15,14 +15,20 @@ from rapidocr_onnxruntime import RapidOCR
 
 import blacklist
 import semantic
+import zhipu_audit
 
 # ==================== 审核规则(参考抖音 / 行业标准) ====================
-# 分类敏感词库(黑词库):按违规大类 + 权重
+# 分类敏感词库(黑词库):绿源集团内容质量检查表·真实规则
 SENSITIVE_CATEGORIES = {
-    "涉政违法": {"weight": 100, "words": ["赌博", "博彩", "毒品", "枪支"]},
-    "低俗色情": {"weight": 90,  "words": ["色情", "约炮", "看片", "裸聊"]},
-    "虚假宣传": {"weight": 80,  "words": ["最", "第一", "国家级", "销量第一", "最佳", "最牛"]},
-    "广告导流": {"weight": 60,  "words": ["加微信", "加V", "私聊", "代开发票"]},
+    "涉政违法": {"weight": 100, "words": ["国旗", "国徽", "国歌", "军旗", "军徽", "钓鱼岛", "南海诸岛"]},
+    "非法改装": {"weight": 95,  "words": ["增容量", "改装大仓", "扩容电池仓", "更换大功率电机", "铅改锂",
+                                        "续航翻倍", "加长座椅", "带娃神器", "解除限速", "可互换",
+                                        "通用型", "兼容多种规格"]},
+    "绝对化用语": {"weight": 80, "words": ["国家级", "最高级", "最佳", "第一", "唯一", "顶级", "极致",
+                                          "首选", "王牌", "销量第一", "遥遥领先", "全网销量冠军",
+                                          "最轻", "最小", "最快", "最远", "最强"]},
+    "虚假宣传": {"weight": 75, "words": ["月销", "热销榜", "国家推荐", "质检总局推荐", "消协推荐", "实验室数据"]},
+    "蹭名牌": {"weight": 70,  "words": ["媲美", "对标", "同款"]},
 }
 
 # 白词库:命中即放行(即使含敏感词),防误杀
@@ -129,6 +135,27 @@ def judge(score):
     return "放行"
 
 
+def _is_visual_violation(raw):
+    """判断 GLM-4V 返回结果是否判定为「违规」"""
+    import json
+
+    # 直接解析 JSON
+    try:
+        data = json.loads(raw)
+        return data.get("违规") == "是"
+    except Exception:
+        pass
+    # 去掉 markdown 围栏再试
+    m = re.search(r"\{.*\}", raw, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            return data.get("违规") == "是"
+        except Exception:
+            pass
+    return "违规" in raw and "是" in raw
+
+
 def main():
     parser = argparse.ArgumentParser(description="视频审核系统")
     parser.add_argument("video", help="视频文件路径")
@@ -181,8 +208,30 @@ def main():
         matcher = None
     max_score, hits = score_texts(texts, matcher)
 
-    # ⑤ 报告
+    # ⑤ 视觉审核(观感审核,多模态 GLM-4V,抽样 5 帧)
+    print("⑤ 视觉审核中(抽样 5 帧)...")
+    visual_hits = []
+    try:
+        frames_list = sorted(os.listdir(frames_dir))
+        n = len(frames_list)
+        if n >= 5:
+            sample_idx = [int(i * (n - 1) / 4) for i in range(5)]
+        else:
+            sample_idx = list(range(n))
+        for i in sample_idx:
+            f = frames_list[i]
+            raw = zhipu_audit.audit_image(os.path.join(frames_dir, f))
+            if _is_visual_violation(raw):
+                visual_hits.append((f, raw))
+                print(f"   ⚠️ 帧 {f} 观感违规")
+    except Exception as e:
+        print(f"   视觉审核失败(跳过): {e}")
+    print(f"   观感违规帧: {len(visual_hits)} 处")
+
+    # ⑥ 报告
     action = judge(max_score)
+    if visual_hits:
+        action = "拦截(观感违规)"
     print("\n" + "=" * 44)
     print("  视频审核报告")
     print("=" * 44)
@@ -194,6 +243,10 @@ def main():
     if hits:
         for f, text, word, category, w in hits:
             print(f"    ⚠️ {f}: 「{text}」命中「{word}」[{category}] (权重 {w})")
+    print(f"  观感违规 : {len(visual_hits)} 处")
+    if visual_hits:
+        for f, raw in visual_hits:
+            print(f"    ⚠️ 帧 {f}: {raw[:80]}")
     print(f"  最高风险 : {max_score}")
     print(f"  处置结论 : 【{action}】")
     print("=" * 44)
