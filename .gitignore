@@ -1,0 +1,12 @@
+# 视频产物(可由脚本重新生成)
+*.mp4
+
+# 抽帧结果(可由脚本重新生成)
+frames/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
