@@ -7,22 +7,45 @@
 """
 import argparse
 import os
+import re
 import tempfile
 
 import cv2
 from rapidocr_onnxruntime import RapidOCR
 
 import blacklist
+import semantic
 
-# ==================== 配置区(集中管理,方便改) ====================
-SENSITIVE_WORDS = {
-    "赌博": 90, "博彩": 85, "色情": 90, "约炮": 80,
-    "加微信": 50, "看片": 60, "代开发票": 70, "私聊": 40,
+# ==================== 审核规则(参考抖音 / 行业标准) ====================
+# 分类敏感词库(黑词库):按违规大类 + 权重
+SENSITIVE_CATEGORIES = {
+    "涉政违法": {"weight": 100, "words": ["赌博", "博彩", "毒品", "枪支"]},
+    "低俗色情": {"weight": 90,  "words": ["色情", "约炮", "看片", "裸聊"]},
+    "虚假宣传": {"weight": 80,  "words": ["最", "第一", "国家级", "销量第一", "最佳", "最牛"]},
+    "广告导流": {"weight": 60,  "words": ["加微信", "加V", "私聊", "代开发票"]},
 }
-HIGH = 80          # 风险分 >= 80:直接拦截
-LOW = 50           # 风险分 <= 50:放行;中间:转人工(灰色地带)
-INTERVAL_SEC = 2.0     # 抽帧:每 2 秒抽一帧
-SCENE_THRESHOLD = 30.0 # 抽帧:场景切换阈值
+
+# 白词库:命中即放行(即使含敏感词),防误杀
+WHITELIST = ["微信支付", "官方微信", "微信公众号"]
+
+# 组合关键词:多个词同时出现才判违规(如 "加"+"微信")
+COMBINATIONS = [
+    (["加", "微信"], "广告导流", 60),
+    (["加", "V"], "广告导流", 60),
+]
+
+# 正则变体匹配:抓字面匹配抓不到的变体(谐音/拆字/空格/字母替换)
+VARIANT_PATTERNS = [
+    (r"加\s*[微薇威Vv芯]\s*信", "广告导流", 60),  # 加微信 / 加威信 / 加V信 / 加微芯
+    (r"[微薇威Vv芯]\s*信", "广告导流", 60),        # 微信 / 威信 / V信(单独出现)
+]
+
+# 两级阈值(参考百度智能审核:确认阈值 + 疑似阈值)
+CONFIRM_THRESHOLD = 80   # 分数 >= 80:确认违规,直接拦截
+SUSPECT_THRESHOLD = 50   # 分数 >= 50:疑似违规,转人工;低于 50:放行
+
+INTERVAL_SEC = 2.0       # 抽帧:每 2 秒抽一帧
+SCENE_THRESHOLD = 30.0   # 抽帧:场景切换阈值
 # ==================================================================
 
 
@@ -64,24 +87,45 @@ def ocr_frames(frames_dir, engine):
     return texts
 
 
-def score_texts(texts):
-    """机审打分:命中敏感词,取最高权重"""
+def score_texts(texts, semantic_matcher=None):
+    """机审打分:白词豁免 → 黑词 → 组合 → 正则变体 → embedding 语义,取最高权重"""
     hits = []
     max_score = 0
     for f, text, conf in texts:
-        for word, weight in SENSITIVE_WORDS.items():
-            if word in text:
-                hits.append((f, text, word, weight))
+        # ① 白词豁免:只扣掉白词本身,不放行整条(剩余文本继续查黑词)
+        cleaned = text
+        for w in WHITELIST:
+            cleaned = cleaned.replace(w, "")
+        # ② 分类黑词匹配(对 cleaned 文本)
+        for category, info in SENSITIVE_CATEGORIES.items():
+            for word in info["words"]:
+                if word in cleaned:
+                    hits.append((f, text, word, category, info["weight"]))
+                    max_score = max(max_score, info["weight"])
+        # ③ 组合关键词匹配(对 cleaned 文本)
+        for words, category, weight in COMBINATIONS:
+            if all(w in cleaned for w in words):
+                hits.append((f, text, "+".join(words), category, weight))
+                max_score = max(max_score, weight)
+        # ④ 正则变体匹配(对 cleaned 文本,抓谐音/拆字/空格)
+        for pattern, category, weight in VARIANT_PATTERNS:
+            if re.search(pattern, cleaned):
+                hits.append((f, text, f"变体:{pattern}", category, weight))
+                max_score = max(max_score, weight)
+        # ⑤ embedding 语义匹配(抓字面/正则都抓不到的语义变体,权重有加成)
+        if semantic_matcher and cleaned.strip():
+            for seed_text, category, weight, sim in semantic_matcher.match(cleaned):
+                hits.append((f, text, f"语义:{seed_text}(相似度{sim:.2f})", category, weight))
                 max_score = max(max_score, weight)
     return max_score, hits
 
 
 def judge(score):
-    """阈值分档:拦截 / 转人工 / 放行"""
-    if score >= HIGH:
+    """两级阈值分档:确认违规(拦截)/ 疑似(转人工)/ 放行"""
+    if score >= CONFIRM_THRESHOLD:
         return "拦截"
-    if score > LOW:
-        return "转人工(灰色地带)"
+    if score >= SUSPECT_THRESHOLD:
+        return "转人工(疑似)"
     return "放行"
 
 
@@ -128,9 +172,14 @@ def main():
     texts = ocr_frames(frames_dir, engine)
     print(f"   识别到 {len(texts)} 条文字")
 
-    # ④ 打分
-    print("④ 打分中...")
-    max_score, hits = score_texts(texts)
+    # ④ 打分(含 embedding 语义检索)
+    print("④ 打分中(含语义检索)...")
+    try:
+        matcher = semantic.SemanticMatcher()
+    except Exception as e:
+        print(f"   语义模型加载失败,跳过语义检索: {e}")
+        matcher = None
+    max_score, hits = score_texts(texts, matcher)
 
     # ⑤ 报告
     action = judge(max_score)
@@ -143,8 +192,8 @@ def main():
     print(f"  识别文字 : {len(texts)} 条")
     print(f"  命中敏感 : {len(hits)} 处")
     if hits:
-        for f, text, word, w in hits:
-            print(f"    ⚠️ {f}: 「{text}」命中「{word}」(权重 {w})")
+        for f, text, word, category, w in hits:
+            print(f"    ⚠️ {f}: 「{text}」命中「{word}」[{category}] (权重 {w})")
     print(f"  最高风险 : {max_score}")
     print(f"  处置结论 : 【{action}】")
     print("=" * 44)
